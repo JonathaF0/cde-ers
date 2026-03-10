@@ -4,7 +4,7 @@ Config = {}
 -- CAD BACKEND CONFIGURATION
 -- ========================================
 Config.CADEndpoint = "https://cdecad.com"  -- Your CAD backend URL (no trailing slash)
-Config.APIKey      = "fvm_35920b265704e004282439dceda5ca008cc1c8b70e32990d7f7efb82df35be8c"                     -- Your community's FiveM API key (fvm_...)
+Config.APIKey      = ""                     -- Your community's FiveM API key (fvm_...)
 
 -- ========================================
 -- ERS INTEGRATION SETTINGS
