@@ -40,6 +40,19 @@ Config.CreateCivilians = true
 Config.CreateVehicles = true
 
 -- ========================================
+-- DISPATCH CALLOUT SETTINGS
+-- ========================================
+-- Allow dispatchers to create ERS callouts from the CAD livemap.
+-- When enabled, this resource polls the CAD for dispatch-created callouts
+-- and triggers them in-game via the night_ers exports.
+Config.EnableDispatchCallouts = true
+
+-- How often (in seconds) to poll the CAD for new dispatch callouts.
+-- The in-game callout is triggered immediately via the client event, so
+-- this polling is only a fallback. 30s keeps API usage low.
+Config.DispatchPollInterval = 30
+
+-- ========================================
 -- TRAFFIC STOP SETTINGS
 -- ========================================
 -- Create civilian + vehicle records and a CAD call when initiating an ERS traffic stop
