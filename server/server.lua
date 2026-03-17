@@ -70,6 +70,28 @@ local function PostToCAD(path, data, callback)
     end, "POST", jsonData, headers)
 end
 
+-- ─── Helper: HTTP GET from CAD API ─────────────────────────────────────────
+local function GetFromCAD(path, callback)
+    local url = GetApiUrl(path)
+    local headers = GetHeaders()
+
+    DebugLog("GET " .. url)
+
+    PerformHttpRequest(url, function(statusCode, responseText, respHeaders)
+        DebugLog("GET Response [" .. tostring(statusCode) .. "]: " .. tostring(responseText))
+
+        if callback then
+            local success = statusCode >= 200 and statusCode < 300
+            local responseData = nil
+            if responseText and responseText ~= "" then
+                local ok, decoded = pcall(json.decode, responseText)
+                if ok then responseData = decoded end
+            end
+            callback(success, responseData, statusCode)
+        end
+    end, "GET", "", headers)
+end
+
 -- ─── Helper: Get callout ID from calloutData ───────────────────────────────
 local function GetCalloutId(calloutData)
     if not calloutData then return nil end
@@ -86,6 +108,18 @@ end
 local function GetPlayerCallSign(source)
     local name = GetPlayerName(source)
     return name or ("Unit-" .. tostring(source))
+end
+
+-- ─── Helper: Get player Discord ID ───────────────────────────────────────────
+-- Returns the raw numeric Discord ID (without the "discord:" prefix) so the
+-- backend can cross-reference it against the active units table.
+local function GetPlayerDiscordId(source)
+    local id = GetPlayerIdentifierByType(source, 'discord')
+    if id then
+        -- Strip "discord:" prefix → return just the numeric ID
+        return id:gsub("discord:", "")
+    end
+    return nil
 end
 
 -- ─── Helper: Map ERS service type ──────────────────────────────────────────
@@ -199,6 +233,7 @@ AddEventHandler("ErsIntegration::OnAcceptedCalloutOffer", function(calloutData)
                     PostToCAD("unit-attach", {
                         ersCalloutId = calloutId,
                         callSign     = GetPlayerCallSign(source),
+                        discordId    = GetPlayerDiscordId(source),
                     })
                 end
 
@@ -415,6 +450,7 @@ local function SendTrafficStop(source, pedData, vehicleData, locationData)
     PostToCAD("traffic-stop", {
         -- Officer
         callSign    = GetPlayerCallSign(source),
+        discordId   = GetPlayerDiscordId(source),
         -- Location
         location    = loc.location or nil,
         postal      = loc.postal or nil,
@@ -865,6 +901,42 @@ RegisterCommand("ers_debug", function(source, args)
     print("[CDE-ERS] Debug mode: " .. (Config.EnableDebug and "ON" or "OFF"))
 end, true)
 
+-- ─── ers_inspect ─────────────────────────────────────────────────────────────
+-- Dumps the structure of one callout from getCallouts() so we can see
+-- the exact fields night_ers expects for createCallout().
+-- Usage: ers_inspect
+RegisterCommand("ers_inspect", function(source, args)
+    print("[CDE-ERS] ─── Inspecting night_ers callout structure ───")
+    local ok, callouts = pcall(function()
+        return exports['night_ers']:getCallouts()
+    end)
+    if not ok or not callouts then
+        print("[CDE-ERS] ERROR: Could not call getCallouts(). Is night_ers running?")
+        return
+    end
+    -- getCallouts() returns a table keyed by callout ID strings
+    local count = 0
+    local firstKey = nil
+    local firstVal = nil
+    print("[CDE-ERS] Callout IDs (keys for createCallout):")
+    for k, v in pairs(callouts) do
+        count = count + 1
+        local name = (type(v) == "table" and v.CalloutName) or "?"
+        print("[CDE-ERS]   [" .. tostring(k) .. "] = " .. name)
+        if not firstKey then firstKey = k; firstVal = v end
+    end
+    print("[CDE-ERS] Total: " .. count)
+    if firstVal and type(firstVal) == "table" then
+        print("[CDE-ERS] First callout full dump (" .. tostring(firstKey) .. "):")
+        for k, v in pairs(firstVal) do
+            local valStr = tostring(v)
+            if type(v) == "table" then valStr = json.encode(v) end
+            print("[CDE-ERS]   " .. tostring(k) .. " (" .. type(v) .. ") = " .. valStr:sub(1, 200))
+        end
+    end
+    print("[CDE-ERS] ────────────────────")
+end, true)
+
 -- ─── ers_test_traffic ──────────────────────────────────────────────────────
 -- Sends a test traffic stop to the CAD to verify the /ers/traffic-stop
 -- endpoint is reachable and working.
@@ -928,9 +1000,239 @@ for _, evtName in ipairs({
     end)
 end
 
+-- ========================================================================
+-- DISPATCH-CREATED ERS CALLOUT POLLING
+-- ========================================================================
+-- Polls the CAD for callouts created from the dispatch livemap and
+-- triggers them in-game via the night_ers export (if available) or
+-- sends a notification to on-shift players.
+
+local dispatchCalloutProcessing = false
+
+local function FindNearestOnShiftPlayer(coords)
+    local nearest = nil
+    local nearestDist = math.huge
+    local players = GetPlayers()
+
+    for _, playerId in ipairs(players) do
+        local ped = GetPlayerPed(playerId)
+        if ped and ped ~= 0 then
+            local pCoords = GetEntityCoords(ped)
+            -- Check if player is on ERS shift via client callback would be ideal,
+            -- but for simplicity we'll send to the nearest player
+            local dist = #(vector3(pCoords.x, pCoords.y, pCoords.z) - vector3(coords.x, coords.y, coords.z or 0.0))
+            if dist < nearestDist then
+                nearestDist = dist
+                nearest = tonumber(playerId)
+            end
+        end
+    end
+
+    return nearest
+end
+
+local function ProcessDispatchCallout(callout)
+    local ersCalloutId = callout.ersCalloutId
+    local callType = callout.callType or "[ERS] Unknown"
+    local location = callout.location or "Unknown"
+    local coords = callout.coordinates or {}
+    local priority = callout.priority or "medium"
+    local description = callout.description or ""
+
+    -- ERS ped behavior config from dispatcher
+    local cfg = callout.ersConfig or {}
+
+    print("[CDE-ERS] Processing dispatch callout: " .. tostring(ersCalloutId) .. " | " .. callType)
+
+    -- night_ers createCallout clones an EXISTING callout by id and overrides
+    -- specific fields from callout.data. Structure:
+    --   { id = "existing_callout_key", data = { CalloutLocations = {...}, ... } }
+    local cx = coords.x or 0.0
+    local cy = coords.y or 0.0
+    local cz = coords.z or 0.0
+
+    -- Find a base callout ID to clone from.
+    -- IMPORTANT: Prefer string keys over numeric keys. Numeric keys (e.g. [1])
+    -- may be previously-cloned callouts or have unexpected state. String keys
+    -- like "shots_fired", "fight" etc. are the original Config.Callouts entries.
+    local baseCalloutId = nil
+    local fallbackCalloutId = nil
+    local baseOk, baseCallouts = pcall(function()
+        return exports['night_ers']:getCallouts()
+    end)
+    if baseOk and baseCallouts and type(baseCallouts) == "table" then
+        for k, v in pairs(baseCallouts) do
+            if type(v) == "table" and v.Enabled ~= false then
+                if type(k) == "string" then
+                    -- Prefer original string-keyed callouts; skip cloned ones (contain "-")
+                    if not string.find(k, "%-") then
+                        baseCalloutId = k
+                        break
+                    elseif not baseCalloutId then
+                        baseCalloutId = k -- use cloned string key as second choice
+                    end
+                elseif not fallbackCalloutId then
+                    fallbackCalloutId = k -- numeric key as last resort
+                end
+            end
+        end
+        if not baseCalloutId then
+            baseCalloutId = fallbackCalloutId
+        end
+    end
+
+    local ersSuccess = false
+    local ersErr = nil
+    if baseCalloutId then
+        print("[CDE-ERS] Using base callout '" .. tostring(baseCalloutId) .. "' as template for dispatch callout")
+        -- Build weapon list from dispatcher config
+        local weaponData = { cfg.weapon or "weapon_unarmed" }
+
+        local calloutTable = {
+            id = baseCalloutId,
+            data = {
+                CalloutLocations = { { x = cx, y = cy, z = cz } },
+                PedWeaponData = weaponData,
+                PedActionOnNoActionFound = cfg.pedAction or "none",
+                PedChanceToFleeFromPlayer = cfg.chanceToFlee or 0,
+                PedChanceToObtainWeapons = cfg.chanceToObtainWeapons or 0,
+                PedChanceToAttackPlayer = cfg.chanceToAttack or 0,
+                PedChanceToSurrender = cfg.chanceToSurrender or 0,
+            }
+        }
+        print("[CDE-ERS] Callout config: weapon=" .. tostring(cfg.weapon) ..
+            " pedAction=" .. tostring(cfg.pedAction) ..
+            " flee=" .. tostring(cfg.chanceToFlee) ..
+            " attack=" .. tostring(cfg.chanceToAttack) ..
+            " surrender=" .. tostring(cfg.chanceToSurrender) ..
+            " obtainWeapons=" .. tostring(cfg.chanceToObtainWeapons))
+        ersSuccess, ersErr = pcall(function()
+            return exports['night_ers']:createCallout(calloutTable)
+        end)
+
+        -- Verify the callout was added to the pool
+        if ersSuccess then
+            local expectedId = tostring(baseCalloutId) .. "-" .. tostring(os.time())
+            local verifyOk, verifyCallouts = pcall(function()
+                return exports['night_ers']:getCallouts()
+            end)
+            if verifyOk and verifyCallouts then
+                local countBefore = 0
+                for _ in pairs(baseCallouts) do countBefore = countBefore + 1 end
+                local countAfter = 0
+                for _ in pairs(verifyCallouts) do countAfter = countAfter + 1 end
+                print("[CDE-ERS] Callout pool: " .. countBefore .. " -> " .. countAfter .. " (expected +1)")
+            end
+        end
+    else
+        ersErr = "No base callouts found in night_ers to clone from"
+    end
+
+    if ersSuccess then
+        print("[CDE-ERS] Dispatch callout added to night_ers pool: " .. tostring(ersCalloutId))
+
+        -- Ensure on-shift players can receive callout offers
+        local players = GetPlayers()
+        for _, playerId in ipairs(players) do
+            pcall(function()
+                exports['night_ers']:setPlayerCalloutOffersEnabled(tonumber(playerId), true)
+            end)
+        end
+    else
+        print("[CDE-ERS] createCallout failed: " .. tostring(ersErr))
+        print("[CDE-ERS] TIP: Run 'ers_inspect' in console to see available callout keys")
+    end
+
+    -- Always notify players (blip + notification) regardless of createCallout result.
+    -- This is the immediate dispatch feedback — the ERS callout itself is added to
+    -- the pool and will be offered by night_ers when its internal timer fires.
+    TriggerClientEvent('cde-ers:dispatchCallout', -1, {
+        ersCalloutId = ersCalloutId,
+        callType = callType,
+        location = location,
+        postal = callout.postal or "",
+        coordinates = coords,
+        priority = priority,
+        description = description,
+    })
+
+    -- Acknowledge receipt so CAD stops sending this callout
+    PostToCAD("ack-dispatch-callout", { ersCalloutId = ersCalloutId }, function(success, data)
+        if success then
+            DebugLog("Acknowledged dispatch callout: " .. tostring(ersCalloutId))
+        else
+            DebugLog("Failed to acknowledge dispatch callout: " .. tostring(ersCalloutId))
+        end
+    end)
+end
+
+-- ─── ers_dispatch_test ───────────────────────────────────────────────────────
+-- Tests the dispatch callout flow locally (no CAD needed). Creates a callout
+-- in night_ers and sends a notification to all players.
+-- Usage: ers_dispatch_test [x] [y] [z]
+RegisterCommand("ers_dispatch_test", function(source, args)
+    print("[CDE-ERS] ─── Running Dispatch Callout Test ───")
+
+    local testX = tonumber(args[1]) or 200.0
+    local testY = tonumber(args[2]) or -900.0
+    local testZ = tonumber(args[3]) or 30.0
+
+    local testCallout = {
+        ersCalloutId = "DISP-TEST-" .. os.time(),
+        callType = "[ERS] Test Dispatch Callout",
+        location = "Test Location",
+        postal = "100",
+        coordinates = { x = testX, y = testY, z = testZ },
+        priority = "high",
+        description = "Test callout from ers_dispatch_test command",
+    }
+
+    print("[CDE-ERS] Creating test dispatch callout at " .. testX .. ", " .. testY .. ", " .. testZ)
+    ProcessDispatchCallout(testCallout)
+    print("[CDE-ERS] ─── Dispatch Callout Test Complete ───")
+end, true)
+
+-- Polling thread
+Citizen.CreateThread(function()
+    -- Wait for resource to fully load
+    Citizen.Wait(5000)
+
+    if not Config.EnableDispatchCallouts then
+        DebugLog("Dispatch callouts disabled in config")
+        return
+    end
+
+    if Config.APIKey == "" then
+        DebugLog("Skipping dispatch callout polling — no API key configured")
+        return
+    end
+
+    local pollInterval = (Config.DispatchPollInterval or 5) * 1000
+
+    print("[CDE-ERS] Dispatch callout polling started (every " .. tostring(Config.DispatchPollInterval or 5) .. "s)")
+
+    while true do
+        Citizen.Wait(pollInterval)
+
+        if not dispatchCalloutProcessing then
+            dispatchCalloutProcessing = true
+
+            GetFromCAD("pending-dispatch-callouts", function(success, data)
+                if success and data and data.callouts and #data.callouts > 0 then
+                    DebugLog("Found " .. tostring(#data.callouts) .. " pending dispatch callout(s)")
+                    for _, callout in ipairs(data.callouts) do
+                        ProcessDispatchCallout(callout)
+                    end
+                end
+                dispatchCalloutProcessing = false
+            end)
+        end
+    end
+end)
+
 -- ─── Startup ────────────────────────────────────────────────────────────────
 print("[CDE-ERS] ERS Bridge for CDECAD loaded successfully")
-print("[CDE-ERS] Console commands: ers_test | ers_test_traffic | ers_status | ers_debug")
+print("[CDE-ERS] Console commands: ers_test | ers_test_traffic | ers_dispatch_test | ers_status | ers_debug | ers_inspect")
 if Config.APIKey == "" then
     print("[CDE-ERS] WARNING: No API key configured! Set Config.APIKey in config.lua")
 end
