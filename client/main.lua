@@ -87,6 +87,37 @@ AddEventHandler('ErsIntegration::RequestLocation', function()
 end)
 
 -- ========================================================================
+-- DISPATCH-CREATED ERS CALLOUT HANDLER
+-- ========================================================================
+-- Receives notification from the server after a dispatch callout has been
+-- added to the night_ers pool via createCallout(). Triggers the native ERS
+-- callout offer by executing /requestcallout so the player gets the
+-- standard ERS accept/decline UI.
+
+RegisterNetEvent('cde-ers:dispatchCallout')
+AddEventHandler('cde-ers:dispatchCallout', function(data)
+    if not data then return end
+
+    DebugLog("Dispatch callout received: " .. tostring(data.callType))
+
+    -- Only trigger for on-shift players who are not already on a callout
+    if not IsPlayerOnErsShift() then
+        DebugLog("Player not on shift, skipping dispatch callout")
+        return
+    end
+    if IsPlayerOnCallout() then
+        DebugLog("Player already on callout, skipping dispatch callout")
+        return
+    end
+
+    -- Trigger the native ERS callout offer. /requestcallout forces night_ers
+    -- to immediately offer the next callout from its pool, which should be
+    -- the dispatch-created one we just added via createCallout().
+    DebugLog("Triggering /requestcallout for dispatch callout: " .. tostring(data.ersCalloutId))
+    ExecuteCommand('requestcallout')
+end)
+
+-- ========================================================================
 -- ERS OPEN-SOURCE CALLBACK FUNCTIONS
 -- ========================================================================
 -- ERS calls these global functions on the client when events occur.
