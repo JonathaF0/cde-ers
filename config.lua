@@ -1,12 +1,6 @@
 Config = {}
 
 -- ========================================
--- CAD BACKEND CONFIGURATION
--- ========================================
-Config.CADEndpoint = "https://cdecad.com"  -- Your CAD backend URL (no trailing slash)
-Config.APIKey      = ""                     -- Your community's FiveM API key (fvm_...)
-
--- ========================================
 -- ERS INTEGRATION SETTINGS
 -- ========================================
 -- These can also be toggled from the CAD admin panel (FiveM Settings).
@@ -57,3 +51,12 @@ Config.DispatchPollInterval = 30
 -- ========================================
 -- Create civilian + vehicle records and a CAD call when initiating an ERS traffic stop
 Config.CreateOnTrafficStop = true
+
+-- ========================================
+-- DUTY / SHIFT SYNC
+-- ========================================
+-- When a player toggles their ERS shift on/off, mirror that to the CAD by
+-- setting their unit status to 10-8 (on) or 10-42 (off). The CAD enforces
+-- this as well via the "Auto On-Duty" toggle in FiveM Settings; both must be
+-- enabled for the sync to fire.
+Config.ToggleDutyOnShift = true
