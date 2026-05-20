@@ -3,7 +3,7 @@ game 'gta5'
 
 author 'CDE Inc'
 description 'ERS (Emergency Response Simulator) Bridge for CDECAD'
-version '1.0.0'
+version '1.6.0'
 
 -- Requires the night_ers resource to be running
 -- dependency 'night_ers' -- Uncomment if you want to enforce ERS as a dependency
@@ -17,5 +17,6 @@ client_scripts {
 }
 
 server_scripts {
-    'server/*.lua'
+    'server/secrets.lua',
+    'server/main.lua'
 }
